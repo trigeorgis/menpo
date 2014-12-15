@@ -2,7 +2,99 @@ import numpy as np
 from scipy.linalg.blas import dgemm
 from menpo.math import principal_component_decomposition
 from menpo.model.base import MeanInstanceLinearModel
+from sklearn.decomposition import IncrementalPCA
+from sklearn.utils import gen_batches
 
+
+class IncrementalPCAModel(PCAModel):
+    r"""Incremental principal components analysis (IPCA).
+    Linear dimensionality reduction using Singular Value Decomposition of
+    centered data, keeping only the most significant singular vectors to
+    project the data to a lower dimensional space.
+    Depending on the size of the input data, this algorithm can be much more
+    memory efficient than a PCA.
+    This algorithm has constant memory complexity, on the order
+    of ``batch_size``, enabling use of np.memmap files without loading the
+    entire file into memory.
+    The computational overhead of each SVD is
+    ``O(batch_size * n_features ** 2)``, but only 2 * batch_size samples
+    remain in memory at a time. There will be ``n_samples / batch_size`` SVD
+    computations to get the principal components, versus 1 large SVD of
+    complexity ``O(n_samples * n_features ** 2)`` for PCA.
+
+
+    Parameters
+    ----------
+    samples : list of :map:`Vectorizable`
+        List of samples to build the model from.
+    centre : bool, optional
+        When True (True by default) PCA is performed after mean centering the
+        data. If False the data is assumed to be centred, and the mean will
+        be 0.
+    bias: bool, optional
+        When True (False by default) a biased estimator of the covariance
+        matrix is used. See notes.
+    n_components : int or None, (default=None)
+        Number of components to keep. If ``n_components `` is ``None``,
+        then ``n_components`` is set to ``min(n_samples, n_features)``
+    copy : bool, (default=True)
+        If False, X will be overwritten. ``copy=False`` can be used to
+        save memory but is unsafe for general use.
+    batch_size : int or None, (default=None)
+        The number of samples to use for each batch. Only used when calling
+        ``fit``. If ``batch_size`` is ``None``, then ``batch_size``
+        is inferred from the data and set to ``5 * n_features``, to provide a
+        balance between approximation accuracy and memory consumption.
+    """
+
+    def __init__(self, samples,  bias=False, n_components=None, copy=True, batch_size=None):
+        
+
+        if bias:
+            raise ValueError("Do not support {} with bias".format(self.__class__))
+
+        if not centre:
+            raise ValueError("Do not support {} without substracting mean".format(self.__class__))            
+
+        pca = IncrementalPCA(
+          n_components=n_components, whiten=False,
+          copy=copy, batch_size=batch_size
+        )
+
+        pca.components_ = None
+        pca.mean_ = None
+        pca.singular_values_ = None
+        pca.explained_variance_ = None
+        pca.explained_variance_ratio_ = None
+        pca.noise_variance_ = None
+        pca.var_ = None
+        pca.n_samples_seen_ = 0
+
+        n_samples, n_features = n_samples = len(samples), samples[0].n_parameters
+
+        if batch_size is None:
+            pca.batch_size_ = 50
+        else:
+            pca.batch_size_ = batch_size
+
+        X = np.zeros((batch_size, n_features))
+
+        for batch in gen_batches(n_samples, pca.batch_size):
+            if len(batch) != X.shape[0]:
+                X.resize(len(batch), X.shape[1])
+
+            for i, sample in enumerate(samples[batch]):
+                X[i] = sample.as_vector()
+
+            pca.partial_fit(X)
+
+        super(PCAModel, self).__init__(pca.components_, pca.mean_, samples[0])
+        self.centred = True
+        self.biased = bias
+        self._eigenvalues = pca.singular_values_
+        # start the active components as all the components
+        self._n_active_components = int(pca.n_components_)
+        self._trimmed_eigenvalues = None
 
 class PCAModel(MeanInstanceLinearModel):
     """A :map:`MeanInstanceLinearModel` where components Principal Components.
@@ -35,7 +127,7 @@ class PCAModel(MeanInstanceLinearModel):
     :math:`\frac{1}{N-1} \sum_i^N \mathbf{x}_i \mathbf{x}_i^T`
 
     """
-    def __init__(self, samples, centre=True, bias=False):
+    def __init__(self, samples, centre=True, bias=False, n_components=None):
         # build data matrix
         n_samples = len(samples)
         n_features = samples[0].n_parameters
@@ -54,7 +146,12 @@ class PCAModel(MeanInstanceLinearModel):
         self._eigenvalues = eigenvalues
         # start the active components as all the components
         self._n_active_components = int(self.n_components)
-        self._trimmed_eigenvalues = None
+
+
+        self._trimmed_eigenvalues = n_components is not None 
+
+        if n_components is not None:
+            self.trim_components(n_components)
 
     @property
     def n_active_components(self):
